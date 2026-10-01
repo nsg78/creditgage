@@ -8,15 +8,44 @@ try{
 const b=typeof req.body==='string'?JSON.parse(req.body):req.body||{};
 if(JSON.stringify(b).length>20000)throw Error('Demande trop volumineuse.');
 const action=b.action;
-if(!['create','track','login','list','update','payment'].includes(action))throw Error('Action inconnue.');
+if(!['create','track','login','list','update','payment','messages','send_message'].includes(action))throw Error('Action inconnue.');
 const ip=String(req.headers['x-forwarded-for']||'unknown').split(',')[0];
-const allowed=await db('rpc/check_rate',{method:'POST',body:{p_key:key(ip+':'+action),p_limit:action==='login'||action==='track'?20:60}});
+const allowed=await db('rpc/check_rate',{method:'POST',body:{p_key:key(ip+':'+action),p_limit:['login','track'].includes(action)?20:action==='messages'?120:60}});
 if(!allowed)return res.status(429).json({error:'Trop de tentatives. Réessayez dans 15 minutes.'});
 if(action==='login'){
 const r=await fetch(process.env.SUPABASE_URL+'/auth/v1/token?grant_type=password',{method:'POST',headers:{apikey:process.env.SUPABASE_SERVICE_ROLE_KEY,'Content-Type':'application/json'},body:JSON.stringify({email:text(b.email,200),password:String(b.password||'')})});
 const data=await r.json();if(!r.ok)throw Error('Connexion refusée. Vérifiez vos identifiants.');
 const admins=await db('admins?user_id=eq.'+encodeURIComponent(data.user.id));if(!admins.length)throw Error('Accès administrateur refusé.');
 return res.json({token:data.access_token});}
+if(action==='messages'||action==='send_message'){
+if(!/^[0-9a-f-]{36}$/.test(b.id||''))throw Error('Dossier invalide.');
+let advisorId=null;
+if(b.audience==='advisor'){
+const token=req.headers.authorization?.replace(/^Bearer /,'');
+if(!token)return res.status(401).json({error:'Connectez-vous à l’espace équipe.'});
+const auth=await fetch(process.env.SUPABASE_URL+'/auth/v1/user',{headers:{apikey:process.env.SUPABASE_SERVICE_ROLE_KEY,Authorization:'Bearer '+token}});
+if(!auth.ok)return res.status(401).json({error:'Session expirée. Reconnectez-vous.'});
+const user=await auth.json();
+if(!(await db('admins?user_id=eq.'+encodeURIComponent(user.id))).length)return res.status(403).json({error:'Accès refusé.'});
+advisorId=user.id;
+if(!(await db('requests?select=id&id=eq.'+b.id)).length)throw Error('Dossier introuvable.');
+}else{
+const p=phone(b.phone),pin=String(b.pin||'');
+if(!/^\d{6,12}$/.test(pin))throw Error('Identifiants invalides.');
+// Le dossier demandé doit appartenir à ce téléphone ET à ce code.
+const rows=await db('requests?select=id,pin_hash&id=eq.'+b.id+'&phone=eq.'+p);
+if(!rows.length||!verify(pin,rows[0].pin_hash))return res.status(403).json({error:'Accès à la conversation refusé.'});
+}
+if(action==='send_message'){
+const body=String(b.message||'').trim();
+if(!body||body.length>4000)throw Error('Votre message doit contenir entre 1 et 4 000 caractères.');
+await db('messages',{method:'POST',body:{id:randomUUID(),request_id:b.id,sender:advisorId?'advisor':'client',advisor_id:advisorId,body}});
+return res.json({ok:true});
+}
+// Derniers messages, restitués dans l’ordre chronologique.
+const messages=await db('messages?select=id,sender,body,created_at&request_id=eq.'+b.id+'&order=created_at.desc,id.desc&limit=200');
+return res.json({messages:messages.reverse()});
+}
 if(action==='create'||action==='track'){
 const p=phone(b.phone),pin=String(b.pin||'');if(!/^\d{6,12}$/.test(pin))throw Error('Choisissez un code de 6 à 12 chiffres.');
 if(action==='track'){
@@ -29,7 +58,8 @@ const name=text(b.name,100),service=text(b.service,60),details=text(b.details),c
 if(name.length<3||details.length<10||!['Prêt sur gage','Courtage en crédit','Accompagnement'].includes(service))throw Error('Complétez votre nom, le service et une description de 10 caractères minimum.');
 if(service==='Prêt sur gage'&&!collateral)throw Error('Décrivez le bien proposé en garantie.');
 const amount=money(b.amount);if(amount<1)throw Error('Indiquez un montant supérieur à zéro.');
-const row={id:randomUUID(),name,phone:p,pin_hash:hash(pin),service,amount,details,collateral,availability:text(b.availability,200)};
+const rib=String(b.rib||'').trim();if(!rib||rib.length>100)throw Error('Renseignez votre RIB (100 caractères maximum).');
+const row={id:randomUUID(),rib,name,phone:p,pin_hash:hash(pin),service,amount,details,collateral,availability:text(b.availability,200)};
 const created=await db('requests',{method:'POST',body:row});return res.json({id:created[0].id});}
 const token=req.headers.authorization?.replace(/^Bearer /,'');if(!token)return res.status(401).json({error:'Reconnectez-vous à l’administration.'});
 const auth=await fetch(process.env.SUPABASE_URL+'/auth/v1/user',{headers:{apikey:process.env.SUPABASE_SERVICE_ROLE_KEY,Authorization:'Bearer '+token}});
